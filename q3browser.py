@@ -39,7 +39,13 @@ MASTER_HOST = "master.ioquake3.org"
 MASTER_PORT = 27950
 PROTOCOL = 68
 QUERY_TIMEOUT = 3
-MAX_CONCURRENT = 50
+# Der Master schickt die Liste in mehreren UDP-Paketen (~1400 B Stück).
+# Kurzes Lese-Timeout: sobald nichts mehr kommt, ist die Liste komplett.
+MASTER_READ_TIMEOUT = 1.5
+MASTER_RETRY_DELAY = 0.6
+MASTER_GOT_REPLY = b"getserversResponse"
+MAX_CONCURRENT = 64
+SCAN_ABORT_TIMEOUT_MS = 5000
 APP_NAME = "Q3 Server Browser"
 ORG_NAME = "q3browser"
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".config", "q3browser.ini")
@@ -79,43 +85,87 @@ def parse_q3_colored(text: str) -> list[tuple[str, Optional[QColor]]]:
             segments.append((seg, cur))
     return segments
 
+# Manche Server benutzen statt ^N auch echte Steuerzeichen als Farbcode,
+# z.B. \x07 (BEL) oder \x1d-\x1f. Die wuerden als Muell in der Tabelle stehen.
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_COLOR_RE = re.compile(r"\^[0-9]")
+
+def clean_control(text: str) -> str:
+    """Steuerzeichen entfernen, ^N-Farbcodes aber BEIBEHALTEN.
+
+    Wird fuer Spielernamen gebraucht, weil der QColoredTextDelegate die
+    ^N-Codes noch zum Einfaerben braucht.
+    """
+    if not text:
+        return ""
+    return _CTRL_RE.sub(" ", text).strip()
+
 def strip_colors(text: str) -> str:
-    return re.sub(r"\^[0-9]", "", text)
+    """Q3-Farbcodes ^0–^9 UND Steuerzeichen entfernen (fuer Hostnamen)."""
+    if not text:
+        return ""
+    return clean_control(_COLOR_RE.sub("", text))
+
+def _recv_master_list(sock: socket.socket) -> list[tuple[str, int]]:
+    """Alle Datagramme eines Master-Antwort-Stoßes einsammeln."""
+    servers: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    while True:
+        try:
+            data, _ = sock.recvfrom(65535)
+        except (socket.timeout, OSError):
+            # Master hat nichts mehr geschickt → Liste ist vollständig
+            break
+
+        idx = data.find(MASTER_GOT_REPLY)
+        if idx == -1:
+            continue
+        pos = idx + len(MASTER_GOT_REPLY)
+
+        while pos < len(data):
+            if data[pos:pos + 1] != b"\\":
+                break
+            pos += 1
+            if data[pos:pos + 3] == b"EOT":
+                break
+            if pos + 6 > len(data):
+                break
+            entry = (".".join(str(b) for b in data[pos:pos + 4]),
+                     (data[pos + 4] << 8) | data[pos + 5])
+            if entry not in seen:           # Duplikate über Paketgrenzen
+                seen.add(entry)
+                servers.append(entry)
+            pos += 6
+    return servers
 
 def query_master(host: str = MASTER_HOST, port: int = MASTER_PORT,
-                 timeout: int = 5) -> list[tuple[str, int]]:
-    """Master-Server abfragen → Liste von (ip, port)"""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(timeout)
+                 timeout: int = 5, retries: int = 1) -> list[tuple[str, int]]:
+    """Master-Server abfragen → Liste von (ip, port)
+
+    Achtung: Der Master antwortet mit MEHREREN Datagrammen (je ~1400 Bytes,
+    also ca. 196 Server pro Paket). Nur das erste Paket zu lesen liefert
+    konstant 196 Server. Deshalb hier eine Lese-Schleife bis zum Timeout.
+    Das letzte Paket endet mit '\\EOT' und ist auf 4 Bytes aufgefüllt.
+
+    Bei schnellen Burst-Anfragen drosselt master.ioquake3.org sporadisch und
+    antwortet gar nicht → daher 'retries'-mal erneut versuchen.
+    """
     req = make_ocp(f"getservers {PROTOCOL} empty empty\n".encode())
-    try:
-        sock.sendto(req, (host, port))
-        data, _ = sock.recvfrom(65535)
-    except (socket.timeout, OSError):
-        return []
-    finally:
-        sock.close()
-
-    hdr = b"getserversResponse"
-    idx = data.find(hdr)
-    if idx == -1:
-        return []
-    pos = idx + len(hdr)
-
-    servers: list[tuple[str, int]] = []
-    while pos < len(data):
-        if data[pos:pos + 1] != b"\\":
-            break
-        pos += 1
-        if pos + 3 <= len(data) and data[pos:pos + 3] == b"EOT":
-            break
-        if pos + 6 > len(data):
-            break
-        ip = ".".join(str(b) for b in data[pos:pos + 4])
-        port = (data[pos + 4] << 8) | data[pos + 5]
-        servers.append((ip, port))
-        pos += 6
-    return servers
+    for attempt in range(retries + 1):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(MASTER_READ_TIMEOUT)
+        try:
+            sock.sendto(req, (host, port))
+            servers = _recv_master_list(sock)
+        except OSError:
+            servers = []
+        finally:
+            sock.close()
+        if servers:
+            return servers
+        if attempt < retries:
+            time.sleep(MASTER_RETRY_DELAY)
+    return []
 
 def query_getstatus(host: str, port: int,
                     timeout: int = QUERY_TIMEOUT) -> Optional[dict]:
@@ -160,16 +210,40 @@ def _parse_kv(data: bytes) -> dict[str, str]:
             d[key] = token.strip()
     return d
 
+def _int(val: Any, default: int = 0) -> int:
+    """int() mit Fallback – verhindert, dass ein kaputter Serverwert
+    den ganzen Server-Eintrag verwirft."""
+    try:
+        return int(str(val).strip())
+    except (TypeError, ValueError):
+        return default
+
 def _parse_players(data: bytes) -> list[dict[str, Any]]:
+    """Spielerzeilen parsen. Es existieren zwei Formate:
+
+    modern:    0 33 "name"           (u.a. aktuelle ioquake3/CPMA-Server)
+    klassisch: 0 33 0\\name\\          (Quake III 1.32c)
+    """
     players: list[dict[str, Any]] = []
-    for line in data.split(b"\n"):
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split(b'"', 2)
-        if len(parts) < 3:
-            continue
-        fp = parts[0].strip().split()
+    for raw in data.split(b"\n"):
+        line = raw.strip()
+        if not line or line.lower().startswith(b"score ping"):
+            continue                      # Kopfzeile "score ping ..."
+
+        name: Optional[str] = None
+        if b'"' in line:
+            # modern: alles zwischen erster und letzter Anführungszeichen
+            head, _, tail = line.partition(b'"')
+            fp = head.split()
+            name = (tail.rsplit(b'"', 1)[0] if tail.endswith(b'"') else tail)
+        else:
+            # klassisch: 0 33 0\name\
+            head, sep, tail = line.partition(b"\\")
+            if not sep:
+                continue
+            fp = head.split()
+            name = tail[:-1] if tail.endswith(b"\\") else tail
+
         if len(fp) < 2:
             continue
         try:
@@ -177,8 +251,9 @@ def _parse_players(data: bytes) -> list[dict[str, Any]]:
             ping = int(fp[1])
         except ValueError:
             continue
-        name = parts[1].decode("latin-1", errors="replace")
-        players.append({"score": score, "ping": ping, "name": name})
+        players.append({"score": score, "ping": ping,
+                        "name": clean_control(
+                            name.decode("latin-1", errors="replace"))})
     return players
 
 def rcon_send(host: str, port: int, password: str, command: str,
@@ -224,15 +299,22 @@ class ServerEntry:
 # ── Scanner (QThread + ThreadPoolExecutor) ───────────────────
 
 class ScanWorker(QObject):
-    """Läuft in eigenem QThread und scannt Master + Server parallel."""
-    server_updated = pyqtSignal(object)
-    progress = pyqtSignal(int, int)
-    finished = pyqtSignal(int)
+    """Läuft in eigenem QThread und scannt Master + Server parallel.
 
-    def __init__(self, master_host: str, master_port: int, parent=None):
+    Alle Signale tragen die generation des Aufrufs, damit Ergebnisse eines
+    abgebrochenen Scans vom Coordinator verworfen werden können.
+    """
+
+    server_updated = pyqtSignal(int, object)   # (generation, ServerEntry)
+    progress = pyqtSignal(int, int, int)       # (generation, done, total)
+    finished = pyqtSignal(int)                 # (generation)
+
+    def __init__(self, master_host: str, master_port: int, generation: int,
+                 parent=None):
         super().__init__(parent)
         self.master_host = master_host
         self.master_port = master_port
+        self.generation = generation
         self._aborted = False
 
     def abort(self):
@@ -241,21 +323,26 @@ class ScanWorker(QObject):
     @pyqtSlot()
     def run(self):
         self._aborted = False
+        gen = self.generation
         servers = query_master(self.master_host, self.master_port)
         if self._aborted or not servers:
-            self.finished.emit(0)
+            self.finished.emit(gen)
             return
 
         total = len(servers)
         done = 0
-        results: list[ServerEntry] = []
         import concurrent.futures
 
         def _query(ip, port):
-            result = query_getstatus(ip, port)
-            if result and not self._aborted:
+            try:
+                result = query_getstatus(ip, port)
+            except OSError:
+                return None
+            if not result or self._aborted:
+                return None
+            try:
                 info = result["info"]
-                se = ServerEntry(
+                return ServerEntry(
                     ip=ip, port=port,
                     hostname=strip_colors(
                         info.get("sv_hostname") or info.get("hostname", "")),
@@ -263,34 +350,37 @@ class ScanWorker(QObject):
                     gametype=gametype_name(
                         info.get("g_gametype") or info.get("gametype", "")),
                     clients=len(result["players"]),
-                    maxclients=int(info.get("sv_maxclients", 0)),
+                    maxclients=_int(info.get("sv_maxclients"), 0),
                     ping=info.get("ping", 9999),
                     players=result["players"],
                     raw=info,
                 )
-                return se
-            return None
+            except Exception:
+                # Defekter Server darf die übrigen nicht verschlucken
+                return None
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as pool:
+        # Bewusst KEIN 'with'-Block: dessen __exit__ ruft shutdown(wait=True)
+        # und würde damit auf allen ~1000 Futures blockieren (minutenlang).
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
+        try:
             fut_map = {pool.submit(_query, ip, port): (ip, port)
                        for ip, port in servers}
             for fut in concurrent.futures.as_completed(fut_map):
                 if self._aborted:
-                    pool.shutdown(wait=False, cancel_futures=True)
                     break
                 try:
                     se = fut.result()
-                    if se:
-                        results.append(se)
                 except Exception:
-                    pass
+                    se = None
+                if se:
+                    # sofort ausliefern → Tabelle füllt sich live
+                    self.server_updated.emit(gen, se)
                 done += 1
-                self.progress.emit(done, total)
+                self.progress.emit(gen, done, total)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
-        # Alle Ergebnisse vom QThread aus emitten
-        for se in results:
-            self.server_updated.emit(se)
-        self.finished.emit(len(results))
+        self.finished.emit(gen)
 
 
 class ScanCoordinator(QObject):
@@ -306,30 +396,87 @@ class ScanCoordinator(QObject):
         self.master_port = master_port
         self._thread: Optional[QThread] = None
         self._worker: Optional[ScanWorker] = None
+        self._generation = 0
+        # Threads, die auf shutdown noch hängen (nicht mehr referenziert,
+        # aber weiterhin am Laufen – dürfen nicht zerstört werden).
+        self._retiring: list[tuple[ScanWorker, QThread]] = []
 
     def start(self):
         self.abort()
-        self._thread = QThread(self)
-        self._worker = ScanWorker(self.master_host, self.master_port)
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.finished.connect(self._on_finished)
-        self._worker.server_updated.connect(self.server_updated)
-        self._worker.progress.connect(self.progress)
-        self._thread.start()
+        self._prune()
+        self._generation += 1
+        gen = self._generation
+
+        thread = QThread(self)
+        worker = ScanWorker(self.master_host, self.master_port, gen)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.server_updated.connect(self._on_server_updated)
+        worker.progress.connect(self._on_progress)
+        worker.finished.connect(self._on_worker_finished)
+
+        self._thread = thread
+        self._worker = worker
+        thread.start()
 
     def abort(self):
-        if self._worker:
-            self._worker.abort()
-        if self._thread and self._thread.isRunning():
-            self._thread.quit()
-            self._thread.wait(2000)
-        self._worker = None
-        self._thread = None
+        """Aktuellen Scan abbrechen und alle bisherigen Generation verwerfen."""
+        self._generation += 1
+        worker = self._worker
+        if worker is not None:
+            worker.abort()
 
-    def _on_finished(self, _count: int):
-        if self._thread:
-            self._thread.quit()
+        thread = self._thread
+        if thread is None:
+            return
+        if thread.isRunning():
+            thread.quit()
+            if not thread.wait(SCAN_ABORT_TIMEOUT_MS):
+                # Läuft noch (hängende getstatus-Queries bis zu 3 s).
+                # Referenz behalten, sonst zerstört Python das Objekt
+                # mitten im Lauf ("QThread: Destroyed while running").
+                self._retiring.append((worker, thread))
+                return
+        self._release()
+
+    def shutdown(self):
+        """Beim Fenster-Schließen: alle Threads sauber beenden."""
+        self.abort()
+        for _worker, thread in self._retiring:
+            thread.quit()
+            thread.wait(SCAN_ABORT_TIMEOUT_MS)
+        self._retiring.clear()
+        self._release()
+
+    def _release(self):
+        self._thread = None
+        self._worker = None
+
+    def _prune(self):
+        self._retiring = [(w, t) for (w, t) in self._retiring if t.isRunning()]
+
+    # ── Slots mit Generations-Filter ─────────────────────────
+
+    @pyqtSlot(int, object)
+    def _on_server_updated(self, gen: int, se: ServerEntry):
+        if gen == self._generation:
+            self.server_updated.emit(se)
+
+    @pyqtSlot(int, int, int)
+    def _on_progress(self, gen: int, done: int, total: int):
+        if gen == self._generation:
+            self.progress.emit(done, total)
+
+    @pyqtSlot(int)
+    def _on_worker_finished(self, gen: int):
+        # Nur der aktuelle Scan darf den Thread beenden – sonst killt das
+        # verspätete Signal eines alten Workers den gerade gestarteten Scan.
+        if gen != self._generation:
+            return
+        thread = self._thread
+        if thread is not None:
+            thread.quit()
         self.finished.emit()
 
 
@@ -1025,7 +1172,7 @@ class MainWindow(QMainWindow):
         self._s.setValue("refresh_interval",
                          str(self._refresh_timer.interval() // 1000
                              if self._refresh_timer.isActive() else 0))
-        self._coord.abort()
+        self._coord.shutdown()
         super().closeEvent(event)
 
 
