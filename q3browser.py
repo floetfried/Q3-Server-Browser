@@ -44,6 +44,8 @@ QUERY_TIMEOUT = 3
 MASTER_READ_TIMEOUT = 1.5
 MASTER_RETRY_DELAY = 0.6
 MASTER_GOT_REPLY = b"getserversResponse"
+# Zeitfenster, um die Folgepakete einer langen RCON-Antwort einzufangen
+RCON_TAIL_TIMEOUT = 0.5
 MAX_CONCURRENT = 64
 SCAN_ABORT_TIMEOUT_MS = 5000
 APP_NAME = "Q3 Server Browser"
@@ -88,17 +90,29 @@ def parse_q3_colored(text: str) -> list[tuple[str, Optional[QColor]]]:
 # Manche Server benutzen statt ^N auch echte Steuerzeichen als Farbcode,
 # z.B. \x07 (BEL) oder \x1d-\x1f. Die wuerden als Muell in der Tabelle stehen.
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+# Wie _CTRL_RE, aber \t \n \r bleiben erhalten – fuer mehrzeilige RCON-Ausgabe
+_CTRL_KEEP_NL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _COLOR_RE = re.compile(r"\^[0-9]")
 
 def clean_control(text: str) -> str:
     """Steuerzeichen entfernen, ^N-Farbcodes aber BEIBEHALTEN.
 
     Wird fuer Spielernamen gebraucht, weil der QColoredTextDelegate die
-    ^N-Codes noch zum Einfaerben braucht.
+    ^N-Codes noch zum Einfaerben braucht. Zeilenumbrueche werden hier
+    absichtlich zu Leerzeichen – Namen sind einzeilig.
     """
     if not text:
         return ""
     return _CTRL_RE.sub(" ", text).strip()
+
+def clean_output(text: str) -> str:
+    """Fuer die RCON-Anzeige: ^N-Farbcodes und Steuerzeichen entfernen,
+    aber Zeilenumbrueche und Tabs BEHALTEN – 'status' ist ein Textblock
+    mit vielen Zeilen, der darf nicht in eine einzige Zeile zusammenfallen.
+    """
+    if not text:
+        return ""
+    return _CTRL_KEEP_NL_RE.sub(" ", _COLOR_RE.sub("", text)).strip()
 
 def strip_colors(text: str) -> str:
     """Q3-Farbcodes ^0–^9 UND Steuerzeichen entfernen (fuer Hostnamen)."""
@@ -258,22 +272,43 @@ def _parse_players(data: bytes) -> list[dict[str, Any]]:
 
 def rcon_send(host: str, port: int, password: str, command: str,
               timeout: int = 3) -> str:
-    """RCON an Server senden, Antwort als String."""
+    """RCON an Server senden, Antwort als String.
+
+    Lange Antworten kommen in MEHREREN Paketen: der Server spult seinen
+    Redirect-Puffer alle SV_OUTPUTBUF_LENGTH (= 1024 - 16) Bytes als eigenes
+    'print\\n'-Paket ab. Nur ein Paket zu lesen schneidet z.B. 'status' auf
+    einem vollen Server mitten in der Spielerliste ab – ohne Fehlermeldung.
+    Deshalb: weiter lesen, solange noch Pakete kommen. Der Präfix muss pro
+    Paket abgeschnitten werden, sonst stünde ab Paket 2 ein 'print' im Text.
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
     payload = f"rcon {password} {command}\n"
+    chunks: list[bytes] = []
     try:
         sock.sendto(make_ocp(payload.encode()), (host, port))
-        data, _ = sock.recvfrom(65535)
-    except (socket.timeout, OSError):
+        first = True
+        while True:
+            try:
+                data, _ = sock.recvfrom(65535)
+            except (socket.timeout, OSError):
+                if first:
+                    return "(Zeitüberschreitung / kein Response)"
+                break                       # erste Antwort war da, Rest leer
+            first = False
+            # Folgepakete kommen unmittelbar hintereinander -> kurz warten
+            sock.settimeout(RCON_TAIL_TIMEOUT)
+            for prefix in (b"\xff\xff\xff\xffprint\n", b"\xff\xff\xff\xff"):
+                if data.startswith(prefix):
+                    data = data[len(prefix):]
+                    break
+            chunks.append(data)
+    except OSError:
         return "(Zeitüberschreitung / kein Response)"
     finally:
         sock.close()
 
-    for prefix in (b"\xff\xff\xff\xffprint\n", b"\xff\xff\xff\xff"):
-        if data.startswith(prefix):
-            return data[len(prefix):].decode("latin-1", errors="replace").strip()
-    return data.decode("latin-1", errors="replace").strip()
+    return b"".join(chunks).decode("latin-1", errors="replace").strip()
 
 def gametype_name(val: str) -> str:
     try:
@@ -1142,7 +1177,12 @@ class MainWindow(QMainWindow):
         self._rcon_execute()
 
     def _rcon_append(self, text: str):
-        self.rcon_output.append(text)
+        # Q3-Konsole haengt hinter jeder Cvar-Ausgabe ein ^7 ("S_COLOR_WHITE"),
+        # damit die Konsole wieder auf Weiss zurueckspringt, z.B.
+        #     "mapname" is:"q3dm6^7"
+        # Das QTextEdit kann ^N nicht rendern -> Codes vor dem Anzeigen entfernen.
+        # clean_output statt strip_colors: muss die Zeilenumbrueche behalten!
+        self.rcon_output.append(clean_output(text))
         self.rcon_output.moveCursor(QTextCursor.MoveOperation.End)
 
     def _open_settings(self):
